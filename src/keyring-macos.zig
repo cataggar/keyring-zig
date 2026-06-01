@@ -87,7 +87,7 @@ fn makeCfCreateDict(service: sec.CFStringRef, key: sec.CFStringRef, value: sec.C
     return cf_dict;
 }
 
-const KeyChainGetError = error{ EntryNotFound, KeyChainReadError, CfStringCreationFailed };
+const KeyChainGetError = error{ EntryNotFound, Locked, KeyChainReadError, CfStringCreationFailed };
 fn _getItem(service: []const u8, key: []const u8, out: *sec.CFTypeRef) KeyChainGetError!sec.OSStatus {
     const cf_service = try makeCfString(service);
     defer sec.CFRelease(cf_service);
@@ -100,6 +100,7 @@ fn _getItem(service: []const u8, key: []const u8, out: *sec.CFTypeRef) KeyChainG
 
     const status = sec.SecItemCopyMatching(cf_attrs, out);
     if (status == sec.errSecItemNotFound) return error.EntryNotFound;
+    if (status == sec.errSecInteractionNotAllowed or status == sec.errSecAuthFailed) return error.Locked;
     if (status != sec.errSecSuccess) return error.KeyChainReadError;
     return status;
 }
@@ -180,6 +181,10 @@ pub fn set(service: []const u8, key: []const u8, value: []const u8) KeyChainWrit
     };
 }
 
+pub fn setAlloc(_: std.mem.Allocator, service: []const u8, key: []const u8, value: []const u8) KeyChainWriteError!void {
+    return set(service, key, value);
+}
+
 const KeyChainDeleteError = error{ EntryNotFound, KeyChainDeleteError, CfStringCreationFailed };
 pub fn delete(service: []const u8, key: []const u8) KeyChainDeleteError!void {
     const cf_service = try makeCfString(service);
@@ -194,4 +199,8 @@ pub fn delete(service: []const u8, key: []const u8) KeyChainDeleteError!void {
     const status = sec.SecItemDelete(query);
     if (status == sec.errSecItemNotFound) return error.EntryNotFound;
     if (status != sec.errSecSuccess) return error.KeyChainDeleteError;
+}
+
+pub fn deleteAlloc(_: std.mem.Allocator, service: []const u8, key: []const u8) KeyChainDeleteError!void {
+    return delete(service, key);
 }
