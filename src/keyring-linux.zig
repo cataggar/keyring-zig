@@ -71,11 +71,11 @@ pub extern "libsecret" fn secret_password_clear_sync(
 ) callconv(.c) gboolean;
 
 const keyring_schema: SecretSchema = .{
-    .name = @ptrCast("keyring-zig-schema"),
+    .name = @ptrCast("org.freedesktop.Secret.Generic"),
     .flags = .SECRET_SCHEMA_NONE,
     .attributes = .{
         SecretSchemaAttribute{ .name = @ptrCast("service"), .type = .SECRET_SCHEMA_ATTRIBUTE_STRING },
-        SecretSchemaAttribute{ .name = @ptrCast("account"), .type = .SECRET_SCHEMA_ATTRIBUTE_STRING },
+        SecretSchemaAttribute{ .name = @ptrCast("username"), .type = .SECRET_SCHEMA_ATTRIBUTE_STRING },
     } ++ [_]SecretSchemaAttribute{.{ .name = null, .type = .SECRET_SCHEMA_ATTRIBUTE_STRING }} ** 30,
 };
 
@@ -90,6 +90,16 @@ fn toNulTerminatedChar(val: []const u8, buf: []u8) [*:0]const c_char {
     return c_val;
 }
 
+fn toLabel(service: []const u8, key: []const u8, buf: []u8) [*:0]const c_char {
+    std.debug.assert(buf.len >= service.len + 1 + key.len + 1);
+    @memcpy(buf[0..service.len], service);
+    buf[service.len] = '/';
+    @memcpy(buf[service.len + 1 .. service.len + 1 + key.len], key);
+    const len = service.len + 1 + key.len;
+    buf[len] = 0;
+    return @ptrCast(buf[0..len :0]);
+}
+
 const KeyChainGetError = error{ EntryNotFound, KeyChainReadError };
 fn readEntry(service: [*:0]const c_char, key: [*:0]const c_char) KeyChainGetError![*:0]c_char {
     var err: ?*GError = null;
@@ -100,7 +110,7 @@ fn readEntry(service: [*:0]const c_char, key: [*:0]const c_char) KeyChainGetErro
         &err,
         "service",
         service,
-        "account",
+        "username",
         key,
         @as(?[*:0]const c_char, null),
     ) orelse {
@@ -121,17 +131,13 @@ pub fn get(service: []const u8, key: []const u8, out_buf: []u8) KeyChainBufferGe
     if (service.len > service_max_len) return error.ServiceTooLong;
     if (key.len > key_max_len) return error.KeyTooLong;
 
-    // Make nul terminated copies of service and key
     var service_buf: [service_max_len + 1:0]u8 = undefined;
     var key_buf: [key_max_len + 1:0]u8 = undefined;
 
     const c_service = toNulTerminatedChar(service, service_buf[0..]);
     const c_key = toNulTerminatedChar(key, key_buf[0..]);
 
-    const val = try readEntry(
-        c_service,
-        c_key,
-    );
+    const val = try readEntry(c_service, c_key);
     defer secret_password_free(val);
 
     const val_slice: []const u8 = @ptrCast(std.mem.span(val));
@@ -142,26 +148,43 @@ pub fn get(service: []const u8, key: []const u8, out_buf: []u8) KeyChainBufferGe
 
 const KeyChainAllocGetError = KeyChainGetError || error{OutOfMemory};
 pub fn getAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8) KeyChainAllocGetError![]u8 {
-    var service_buf: []u8 = try gpa.alloc(u8, service.len + 1);
+    const service_buf = try gpa.alloc(u8, service.len + 1);
     defer gpa.free(service_buf);
-    var key_buf: []u8 = try gpa.alloc(u8, key.len + 1);
+    const key_buf = try gpa.alloc(u8, key.len + 1);
     defer gpa.free(key_buf);
 
-    const c_service = toNulTerminatedChar(service, service_buf[0..]);
-    const c_key = toNulTerminatedChar(key, key_buf[0..]);
+    const c_service = toNulTerminatedChar(service, service_buf);
+    const c_key = toNulTerminatedChar(key, key_buf);
 
-    const val = try readEntry(
-        c_service,
-        c_key,
-    );
+    const val = try readEntry(c_service, c_key);
     defer secret_password_free(val);
 
     const val_slice: []const u8 = @ptrCast(std.mem.span(val));
-    const return_val = try gpa.dupe(u8, val_slice);
-    return return_val;
+    return gpa.dupe(u8, val_slice);
 }
 
-const KeyChainWriteError = error{ ServiceTooLong, KeyTooLong, ValueTooLong, KeyChainWriteError } || std.fmt.BufPrintError;
+fn writeEntry(service: [*:0]const c_char, key: [*:0]const c_char, label: [*:0]const c_char, value: [*:0]const c_char) error{KeyChainWriteError}!void {
+    var err: ?*GError = null;
+    const success = secret_password_store_sync(
+        &keyring_schema,
+        null,
+        label,
+        value,
+        null,
+        &err,
+        "service",
+        service,
+        "username",
+        key,
+        @as(?[*:0]const c_char, null),
+    );
+    if (success == 0) {
+        if (err) |err_val| g_error_free(err_val);
+        return error.KeyChainWriteError;
+    }
+}
+
+const KeyChainWriteError = error{ ServiceTooLong, KeyTooLong, ValueTooLong, KeyChainWriteError };
 pub fn set(service: []const u8, key: []const u8, value: []const u8) KeyChainWriteError!void {
     if (service.len > service_max_len) return error.ServiceTooLong;
     if (key.len > key_max_len) return error.KeyTooLong;
@@ -173,30 +196,50 @@ pub fn set(service: []const u8, key: []const u8, value: []const u8) KeyChainWrit
     var key_buf: [key_max_len + 1]u8 = undefined;
     const c_key = toNulTerminatedChar(key, key_buf[0..]);
 
-    // service_buf + key_buf + 1 for separator + 1 for nul
-    var label_buf: [2560 + 1 + 1]u8 = undefined;
-    const label = try std.fmt.bufPrint(&label_buf, "{s}/{s}", .{ service, key });
-    label_buf[label.len] = 0;
-    const c_label: [:0]c_char = @ptrCast(label_buf[0..label.len :0]);
+    var label_buf: [service_max_len + 1 + key_max_len + 1]u8 = undefined;
+    const c_label = toLabel(service, key, label_buf[0..]);
 
     var val_buf: [value_max_len + 1]u8 = undefined;
     const c_val = toNulTerminatedChar(value, val_buf[0..]);
 
+    return writeEntry(c_service, c_key, c_label, c_val);
+}
+
+const KeyChainAllocWriteError = error{ OutOfMemory, KeyChainWriteError };
+pub fn setAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8, value: []const u8) KeyChainAllocWriteError!void {
+    const service_buf = try gpa.alloc(u8, service.len + 1);
+    defer gpa.free(service_buf);
+    const key_buf = try gpa.alloc(u8, key.len + 1);
+    defer gpa.free(key_buf);
+    const label_buf = try gpa.alloc(u8, service.len + 1 + key.len + 1);
+    defer gpa.free(label_buf);
+    const value_buf = try gpa.alloc(u8, value.len + 1);
+    defer gpa.free(value_buf);
+
+    const c_service = toNulTerminatedChar(service, service_buf);
+    const c_key = toNulTerminatedChar(key, key_buf);
+    const c_label = toLabel(service, key, label_buf);
+    const c_val = toNulTerminatedChar(value, value_buf);
+
+    return writeEntry(c_service, c_key, c_label, c_val);
+}
+
+fn clearEntry(service: [*:0]const c_char, key: [*:0]const c_char) error{KeyChainDeleteError}!void {
     var err: ?*GError = null;
-    const success = secret_password_store_sync(
+    const success = secret_password_clear_sync(
         &keyring_schema,
-        null,
-        c_label,
-        c_val,
         null,
         &err,
         "service",
-        c_service,
-        "account",
-        c_key,
+        service,
+        "username",
+        key,
         @as(?[*:0]const c_char, null),
     );
-    if (success == 0) return error.KeyChainWriteError;
+    if (success == 0) {
+        if (err) |err_val| g_error_free(err_val);
+        return error.KeyChainDeleteError;
+    }
 }
 
 const KeyChainDeleteError = error{ ServiceTooLong, KeyTooLong, KeyChainDeleteError };
@@ -210,16 +253,18 @@ pub fn delete(service: []const u8, key: []const u8) KeyChainDeleteError!void {
     var key_buf: [key_max_len + 1]u8 = undefined;
     const c_key = toNulTerminatedChar(key, key_buf[0..]);
 
-    var err: ?*GError = null;
-    const success = secret_password_clear_sync(
-        &keyring_schema,
-        null,
-        &err,
-        "service",
-        c_service,
-        "account",
-        c_key,
-        @as(?[*:0]const c_char, null),
-    );
-    if (success == 0) return error.KeyChainDeleteError;
+    return clearEntry(c_service, c_key);
+}
+
+const KeyChainAllocDeleteError = error{ OutOfMemory, KeyChainDeleteError };
+pub fn deleteAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8) KeyChainAllocDeleteError!void {
+    const service_buf = try gpa.alloc(u8, service.len + 1);
+    defer gpa.free(service_buf);
+    const key_buf = try gpa.alloc(u8, key.len + 1);
+    defer gpa.free(key_buf);
+
+    const c_service = toNulTerminatedChar(service, service_buf);
+    const c_key = toNulTerminatedChar(key, key_buf);
+
+    return clearEntry(c_service, c_key);
 }
