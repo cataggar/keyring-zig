@@ -140,22 +140,19 @@ fn readCred(name: [:0]const u16, out: ?*?*CREDENTIALW) KeyChainGetError!void {
 }
 
 fn nameLen(service: []const u8, key: []const u8) usize {
-    // +1 for ':', +1 for null terminator
-    return service.len + key.len + 1 + 1;
+    // +1 for '@', +1 for null terminator
+    return key.len + service.len + 1 + 1;
 }
 
 fn makeName(service: []const u8, key: []const u8, out_buf: []u16) error{InvalidUtf8}![:0]u16 {
-    // var buf: [10 * 1024]u8 = undefined;
-    // const out = try std.fmt.bufPrint(&buf, "{s}:{s}", .{ service, key });
-    // const utf16_len = try std.unicode.utf8ToUtf16Le(out_buf, out);
-    const post_service = try std.unicode.utf8ToUtf16Le(out_buf[0..], service);
-    out_buf[post_service] = ':';
-    const post_key = try std.unicode.utf8ToUtf16Le(out_buf[post_service + 1 .. out_buf.len - 1], key);
-    out_buf[post_service + post_key + 1] = 0;
-    return out_buf[0 .. post_service + post_key + 1 :0];
+    const post_key = try std.unicode.utf8ToUtf16Le(out_buf[0..], key);
+    out_buf[post_key] = '@';
+    const post_service = try std.unicode.utf8ToUtf16Le(out_buf[post_key + 1 .. out_buf.len - 1], service);
+    out_buf[post_key + post_service + 1] = 0;
+    return out_buf[0 .. post_key + post_service + 1 :0];
 }
 
-const KeyChainBufferGetError = KeyChainGetError || std.fmt.BufPrintError || error{ BufferTooSmall, InvalidUtf8, ServiceTooLong, KeyTooLong };
+const KeyChainBufferGetError = KeyChainGetError || error{ BufferTooSmall, InvalidUtf8, ServiceTooLong, KeyTooLong };
 pub fn get(service: []const u8, key: []const u8, out_buf: []u8) KeyChainBufferGetError![]u8 {
     if (service.len > service_max_len) return error.ServiceTooLong;
     if (key.len > key_max_len) return error.KeyTooLong;
@@ -174,7 +171,7 @@ pub fn get(service: []const u8, key: []const u8, out_buf: []u8) KeyChainBufferGe
     return out_buf[0..len];
 }
 
-const KeyChainAllocGetError = KeyChainGetError || std.fmt.BufPrintError || error{ OutOfMemory, InvalidUtf8 };
+const KeyChainAllocGetError = KeyChainGetError || error{ OutOfMemory, InvalidUtf8 };
 pub fn getAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8) KeyChainAllocGetError![]u8 {
     const target_name_buf = try gpa.alloc(u16, nameLen(service, key));
     defer gpa.free(target_name_buf);
@@ -186,8 +183,27 @@ pub fn getAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8) Ke
 
     const blob_ptr: [*]u8 = @ptrCast(res.?.CredentialBlob orelse return error.KeyChainReadError);
     const len: usize = @intCast(res.?.CredentialBlobSize);
-    const val = try gpa.dupe(u8, blob_ptr[0..len]);
-    return val;
+    return gpa.dupe(u8, blob_ptr[0..len]);
+}
+
+fn writeCred(target_name: [:0]u16, user_name: [:0]u16, value: []const u8) error{KeyChainWriteError}!void {
+    var data: CREDENTIALW = .{
+        .Flags = .{},
+        .Type = .GENERIC,
+        .TargetName = target_name.ptr,
+        .Comment = null,
+        .LastWritten = std.mem.zeroes(FILETIME),
+        .CredentialBlobSize = @intCast(value.len),
+        .CredentialBlob = @ptrCast(@constCast(value.ptr)),
+        .Persist = .LOCAL_MACHINE,
+        .AttributeCount = 0,
+        .Attributes = null,
+        .TargetAlias = null,
+        .UserName = user_name.ptr,
+    };
+
+    const status = CredWriteW(&data, 0);
+    if (status == 0) return error.KeyChainWriteError;
 }
 
 const KeyChainWriteError = error{ InvalidUtf8, ServiceTooLong, KeyTooLong, KeyChainWriteError };
@@ -203,23 +219,32 @@ pub fn set(service: []const u8, key: []const u8, value: []const u8) KeyChainWrit
     usr_buf[usr_len] = 0;
     const usr = usr_buf[0..usr_len :0];
 
-    var data: CREDENTIALW = .{
-        .Flags = .{},
-        .Type = .GENERIC,
-        .TargetName = target_name.ptr,
-        .Comment = null,
-        .LastWritten = std.mem.zeroes(FILETIME),
-        .CredentialBlobSize = @intCast(value.len),
-        .CredentialBlob = @ptrCast(@constCast(value.ptr)),
-        .Persist = .LOCAL_MACHINE,
-        .AttributeCount = 0,
-        .Attributes = null,
-        .TargetAlias = null,
-        .UserName = usr.ptr,
-    };
+    return writeCred(target_name, usr, value);
+}
 
-    const status = CredWriteW(&data, 0);
-    if (status == 0) return error.KeyChainWriteError;
+const KeyChainAllocWriteError = error{ OutOfMemory, InvalidUtf8, KeyChainWriteError };
+pub fn setAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8, value: []const u8) KeyChainAllocWriteError!void {
+    const target_name_buf = try gpa.alloc(u16, nameLen(service, key));
+    defer gpa.free(target_name_buf);
+    const target_name = try makeName(service, key, target_name_buf);
+
+    const usr_buf = try gpa.alloc(u16, key.len + 1);
+    defer gpa.free(usr_buf);
+    const usr_len = try std.unicode.utf8ToUtf16Le(usr_buf, key);
+    usr_buf[usr_len] = 0;
+    const usr = usr_buf[0..usr_len :0];
+
+    return writeCred(target_name, usr, value);
+}
+
+fn deleteCred(target_name: [:0]const u16) error{ EntryNotFound, KeyChainDeleteError }!void {
+    const status = CredDeleteW(target_name.ptr, @intFromEnum(CRED_TYPE.GENERIC), 0);
+    if (status == 0) {
+        switch (GetLastError()) {
+            1168 => return error.EntryNotFound,
+            else => return error.KeyChainDeleteError,
+        }
+    }
 }
 
 const KeyChainDeleteError = error{ EntryNotFound, InvalidUtf8, ServiceTooLong, KeyTooLong, KeyChainDeleteError };
@@ -230,24 +255,27 @@ pub fn delete(service: []const u8, key: []const u8) KeyChainDeleteError!void {
     var target_name_buf: [service_max_len + key_max_len + 2]u16 = undefined;
     const target_name = try makeName(service, key, &target_name_buf);
 
-    const status = CredDeleteW(target_name.ptr, @intFromEnum(CRED_TYPE.GENERIC), 0);
-    if (status == 0) {
-        switch (GetLastError()) {
-            1168 => return error.EntryNotFound,
-            else => return error.KeyChainDeleteError,
-        }
-    }
+    return deleteCred(target_name);
+}
+
+const KeyChainAllocDeleteError = error{ OutOfMemory, EntryNotFound, InvalidUtf8, KeyChainDeleteError };
+pub fn deleteAlloc(gpa: std.mem.Allocator, service: []const u8, key: []const u8) KeyChainAllocDeleteError!void {
+    const target_name_buf = try gpa.alloc(u16, nameLen(service, key));
+    defer gpa.free(target_name_buf);
+    const target_name = try makeName(service, key, target_name_buf);
+
+    return deleteCred(target_name);
 }
 
 test "makeName formats and terminates utf16 target name" {
     var ascii_buf: [64]u16 = undefined;
     const ascii = try makeName("service", "user", &ascii_buf);
-    try std.testing.expectEqualSlices(u16, &[_]u16{ 's', 'e', 'r', 'v', 'i', 'c', 'e', ':', 'u', 's', 'e', 'r' }, ascii);
+    try std.testing.expectEqualSlices(u16, &[_]u16{ 'u', 's', 'e', 'r', '@', 's', 'e', 'r', 'v', 'i', 'c', 'e' }, ascii);
     try std.testing.expectEqual(@as(u16, 0), ascii_buf[ascii.len]);
 
     var unicode_buf: [64]u16 = undefined;
     const unicode = try makeName("palvelu", "käyttäjä", &unicode_buf);
-    const expected = std.unicode.utf8ToUtf16LeStringLiteral("palvelu:käyttäjä");
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("käyttäjä@palvelu");
     try std.testing.expectEqualSlices(u16, expected, unicode);
     try std.testing.expectEqual(@as(u16, 0), unicode_buf[unicode.len]);
 }
