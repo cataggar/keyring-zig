@@ -8,7 +8,7 @@ Small cross-platform keyring access for Zig.
 
 - macOS: supported
 - Windows: supported
-- Linux: supported via libsecret
+- Linux: supported via libsecret (default); pure-Zig D-Bus client opt-in via `-Dlinux-backend=native`
 - File backend: optional, opt-in via `-Dfile-backend=true`
 
 ## API
@@ -32,7 +32,17 @@ pub fn getProperty(gpa: std.mem.Allocator, name: []const u8) std.mem.Allocator.E
 
 ## Linux Notes
 
-The Linux backend uses `libsecret`.
+The Linux backend talks to `org.freedesktop.secrets` (Secret Service). Two
+implementations are available, selectable at build time:
+
+| `-Dlinux-backend=` | Implementation                                                | Linker deps              |
+|--------------------|---------------------------------------------------------------|--------------------------|
+| `libsecret` (default) | C ABI wrapper around `libsecret-1`                          | `libsecret-1`, `glib-2.0`, `libc` |
+| `native`           | Pure-Zig D-Bus client (`src/dbus/`, `src/secret_service/`)    | `libc` only              |
+
+Both store items under the schema `org.freedesktop.Secret.Generic` with
+`service` and `username` attributes, so a switch is transparent to existing
+data and to other Secret Service clients (including Python `keyring`).
 
 The non-allocating Linux calls currently use fixed stack buffers for NUL-terminated C-string conversion, so they impose a few input size limits:
 
