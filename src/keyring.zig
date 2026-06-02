@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ EntryNotFound, NoStorageAccess, Locked, PlatformFailure, Ambiguous, OutOfMemory, InputTooLong, BufferTooSmall, InvalidUtf8 };
-pub const Backend = enum { secret_service, keychain, win_credential, null_backend };
+pub const Backend = enum { secret_service, keychain, win_credential, file, null_backend };
 
 const native_backend: Backend = switch (builtin.os.tag) {
     .linux => .secret_service,
@@ -20,6 +21,7 @@ const os_keyring = switch (builtin.os.tag) {
     else => @compileError("Unsupported OS"),
 };
 const null_keyring = @import("keyring-null.zig");
+const file_keyring = @import("keyring-file.zig");
 
 var default_backend: ?Backend = null;
 var env_backend_checked = false;
@@ -39,6 +41,10 @@ pub fn availableBackends(out: []Backend) []Backend {
     var len: usize = 0;
     if (len < out.len) {
         out[len] = native_backend;
+        len += 1;
+    }
+    if (file_keyring.enabled and len < out.len) {
+        out[len] = .file;
         len += 1;
     }
     if (len < out.len) {
@@ -69,6 +75,7 @@ pub fn getProperty(gpa: Allocator, name: []const u8) Allocator.Error!?[]u8 {
 pub fn get(service: []const u8, key: []const u8, out_buf: []u8) Error![]u8 {
     return switch (currentBackend()) {
         native_backend => os_keyring.get(service, key, out_buf) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.get(service, key, out_buf) else unreachable,
         .null_backend => null_keyring.get(service, key, out_buf),
         else => unreachable,
     };
@@ -77,6 +84,7 @@ pub fn get(service: []const u8, key: []const u8, out_buf: []u8) Error![]u8 {
 pub fn getAlloc(gpa: Allocator, service: []const u8, key: []const u8) Error![]u8 {
     return switch (currentBackend()) {
         native_backend => os_keyring.getAlloc(gpa, service, key) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.getAlloc(gpa, service, key) else unreachable,
         .null_backend => null_keyring.getAlloc(gpa, service, key),
         else => unreachable,
     };
@@ -85,6 +93,7 @@ pub fn getAlloc(gpa: Allocator, service: []const u8, key: []const u8) Error![]u8
 pub fn set(service: []const u8, key: []const u8, value: []const u8) Error!void {
     return switch (currentBackend()) {
         native_backend => os_keyring.set(service, key, value) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.set(service, key, value) else unreachable,
         .null_backend => null_keyring.set(service, key, value),
         else => unreachable,
     };
@@ -93,6 +102,7 @@ pub fn set(service: []const u8, key: []const u8, value: []const u8) Error!void {
 pub fn setAlloc(gpa: Allocator, service: []const u8, key: []const u8, value: []const u8) Error!void {
     return switch (currentBackend()) {
         native_backend => os_keyring.setAlloc(gpa, service, key, value) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.setAlloc(gpa, service, key, value) else unreachable,
         .null_backend => null_keyring.setAlloc(gpa, service, key, value),
         else => unreachable,
     };
@@ -101,6 +111,7 @@ pub fn setAlloc(gpa: Allocator, service: []const u8, key: []const u8, value: []c
 pub fn delete(service: []const u8, key: []const u8) Error!void {
     return switch (currentBackend()) {
         native_backend => os_keyring.delete(service, key) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.delete(service, key) else unreachable,
         .null_backend => null_keyring.delete(service, key),
         else => unreachable,
     };
@@ -109,6 +120,7 @@ pub fn delete(service: []const u8, key: []const u8) Error!void {
 pub fn deleteAlloc(gpa: Allocator, service: []const u8, key: []const u8) Error!void {
     return switch (currentBackend()) {
         native_backend => os_keyring.deleteAlloc(gpa, service, key) catch |err| return normalizeError(err),
+        .file => if (file_keyring.enabled) file_keyring.deleteAlloc(gpa, service, key) else unreachable,
         .null_backend => null_keyring.deleteAlloc(gpa, service, key),
         else => unreachable,
     };
@@ -141,6 +153,7 @@ fn normalizeError(err: anyerror) Error {
 fn isBackendAvailable(backend: Backend) bool {
     return switch (backend) {
         native_backend, .null_backend => true,
+        .file => file_keyring.enabled,
         else => false,
     };
 }
@@ -161,6 +174,7 @@ fn parseBackend(value: []const u8) ?Backend {
     if (std.mem.eql(u8, value, "secret_service")) return .secret_service;
     if (std.mem.eql(u8, value, "keychain")) return .keychain;
     if (std.mem.eql(u8, value, "win_credential")) return .win_credential;
+    if (std.mem.eql(u8, value, "file")) return .file;
     if (std.mem.eql(u8, value, "null") or std.mem.eql(u8, value, "null_backend")) return .null_backend;
     return null;
 }
@@ -255,17 +269,23 @@ test "available backends include native and null" {
     var buf: [4]Backend = undefined;
     const backends = availableBackends(&buf);
 
-    try std.testing.expectEqual(@as(usize, 2), backends.len);
+    const expected_len: usize = if (file_keyring.enabled) 3 else 2;
+    try std.testing.expectEqual(expected_len, backends.len);
     try std.testing.expectEqual(native_backend, backends[0]);
-    try std.testing.expectEqual(Backend.null_backend, backends[1]);
+    if (file_keyring.enabled) {
+        try std.testing.expectEqual(Backend.file, backends[1]);
+        try std.testing.expectEqual(Backend.null_backend, backends[2]);
+    } else {
+        try std.testing.expectEqual(Backend.null_backend, backends[1]);
+    }
 }
 
 test "setDefaultBackend rejects unavailable backend" {
-    const unavailable: Backend = switch (native_backend) {
+    const unavailable: Backend = if (!file_keyring.enabled) .file else switch (native_backend) {
         .secret_service => .keychain,
         .keychain => .secret_service,
         .win_credential => .secret_service,
-        .null_backend => unreachable,
+        .file, .null_backend => unreachable,
     };
 
     try std.testing.expectError(error.BackendUnavailable, setDefaultBackend(unavailable));
