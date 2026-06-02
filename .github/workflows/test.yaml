@@ -43,8 +43,11 @@ jobs:
             secret-tool lookup service keyring-zig-ci account probe
             secret-tool clear service keyring-zig-ci account probe
             zig build --verbose --summary all test
+            zig build --verbose --summary all test -Dfile-backend=true
           '
 
       - name: Run tests
         if: runner.os != 'Linux'
-        run: zig build --verbose --summary all test
+        run: |
+          zig build --verbose --summary all test
+          zig build --verbose --summary all test -Dfile-backend=true

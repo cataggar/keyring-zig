@@ -21,16 +21,28 @@ fn linkPlatformDeps(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
+    const enable_file_backend = b.option(
+        bool,
+        "file-backend",
+        "Include the optional file backend (XDG path, AES-GCM, Argon2id passphrase)",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_file_backend", enable_file_backend);
+    const build_options_mod = build_options.createModule();
+
     const mod = b.addModule("keyring_zig", .{
         .root_source_file = b.path("src/keyring.zig"),
         .target = target,
     });
+    mod.addImport("build_options", build_options_mod);
     linkPlatformDeps(mod, target.result.os.tag);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/keyring.zig"),
         .target = target,
     });
+    test_mod.addImport("build_options", build_options_mod);
 
     const mod_tests = b.addTest(.{
         .root_module = test_mod,
