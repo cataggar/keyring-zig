@@ -52,4 +52,20 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // Standalone tests for the in-tree D-Bus client. Compiled without any
+    // platform dependencies so they run on any host (and verify the dbus
+    // core in isolation from the keyring backend).
+    const dbus_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dbus/dbus.zig"),
+        .target = target,
+    });
+    if (target.result.os.tag == .linux) dbus_test_mod.link_libc = true;
+    const dbus_tests = b.addTest(.{
+        .root_module = dbus_test_mod,
+    });
+    const run_dbus_tests = b.addRunArtifact(dbus_tests);
+    const dbus_test_step = b.step("test-dbus", "Run D-Bus core tests");
+    dbus_test_step.dependOn(&run_dbus_tests.step);
+    test_step.dependOn(&run_dbus_tests.step);
 }
