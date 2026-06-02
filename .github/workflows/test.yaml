@@ -28,32 +28,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             dbus \
-            gnome-keyring \
-            libglib2.0-dev \
-            libsecret-1-dev \
-            libsecret-tools
+            gnome-keyring
 
-      - name: Run tests on Linux (libsecret backend)
+      - name: Run tests on Linux
         if: runner.os == 'Linux'
         shell: bash
         run: |
           dbus-run-session -- bash -lc '
             eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
-            secret-tool store --label="keyring-zig-ci-probe" service keyring-zig-ci account probe <<<'"'"'probe-value'"'"'
-            secret-tool lookup service keyring-zig-ci account probe
-            secret-tool clear service keyring-zig-ci account probe
             zig build --verbose --summary all test
             zig build --verbose --summary all test -Dfile-backend=true
-          '
-
-      - name: Run tests on Linux (native D-Bus backend)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          dbus-run-session -- bash -lc '
-            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
-            zig build --verbose --summary all test -Dlinux-backend=native
-            zig build --verbose --summary all test -Dlinux-backend=native -Dfile-backend=true
           '
 
       - name: Run tests
