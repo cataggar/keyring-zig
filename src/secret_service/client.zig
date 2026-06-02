@@ -16,6 +16,7 @@ const connection = dbus.connection;
 
 const encoding = @import("encoding.zig");
 const session = @import("session.zig");
+const prompt = @import("prompt.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("secret_service.client requires Linux");
@@ -50,13 +51,17 @@ pub fn open(gpa: Allocator) Error!Client {
 }
 
 /// Look up the value for `(service, key)`. Returns `EntryNotFound` when no
-/// item matches, `Locked` when only locked items match and we cannot unlock
-/// without a prompt.
+/// item matches. Locked items are unlocked transparently via the Secret
+/// Service prompt; if the user dismisses the prompt the call returns
+/// `error.Locked`.
 pub fn get(client: *Client, service: []const u8, key: []const u8, out_gpa: Allocator) Error![]u8 {
     const found = try searchItem(client, service, key);
     const item_path = switch (found) {
         .unlocked => |p| p,
-        .locked => return Error.Locked,
+        .locked => |p| blk: {
+            try unlock(client, p);
+            break :blk p;
+        },
         .none => return Error.EntryNotFound,
     };
     defer client.gpa.free(item_path);
@@ -103,31 +108,47 @@ pub fn set(client: *Client, service: []const u8, key: []const u8, value: []const
         true,
     );
 
-    var reply = connection.call(&client.conn, .{
-        .destination = session.service_destination,
-        .path = collection,
-        .interface = "org.freedesktop.Secret.Collection",
-        .member = "CreateItem",
-        .signature = "a{sv}(oayays)b",
-        .body = body.items,
-    }) catch return Error.PlatformFailure;
-    defer reply.deinit();
-    if (reply.err) |e| {
-        if (std.mem.endsWith(u8, e.name, ".IsLocked")) return Error.Locked;
-        return Error.PlatformFailure;
-    }
+    var attempt: u8 = 0;
+    while (true) : (attempt += 1) {
+        var reply = connection.call(&client.conn, .{
+            .destination = session.service_destination,
+            .path = collection,
+            .interface = "org.freedesktop.Secret.Collection",
+            .member = "CreateItem",
+            .signature = "a{sv}(oayays)b",
+            .body = body.items,
+        }) catch return Error.PlatformFailure;
+        defer reply.deinit();
+        if (reply.err) |e| {
+            if (attempt == 0 and std.mem.endsWith(u8, e.name, ".IsLocked")) {
+                try unlock(client, collection);
+                continue;
+            }
+            return Error.PlatformFailure;
+        }
 
-    var r = wire.Reader.init(reply.body);
-    _ = r.readObjectPath() catch return Error.PlatformFailure;
-    const prompt_path = r.readObjectPath() catch return Error.PlatformFailure;
-    if (!std.mem.eql(u8, prompt_path, "/")) return Error.Locked;
+        var r = wire.Reader.init(reply.body);
+        _ = r.readObjectPath() catch return Error.PlatformFailure;
+        const prompt_path = r.readObjectPath() catch return Error.PlatformFailure;
+        if (!std.mem.eql(u8, prompt_path, "/")) {
+            prompt.run(&client.conn, prompt_path) catch |e| return switch (e) {
+                error.Locked => Error.Locked,
+                error.OutOfMemory => Error.OutOfMemory,
+                else => Error.PlatformFailure,
+            };
+        }
+        return;
+    }
 }
 
 pub fn delete(client: *Client, service: []const u8, key: []const u8) Error!void {
     const found = try searchItem(client, service, key);
     const item_path = switch (found) {
         .unlocked => |p| p,
-        .locked => return Error.Locked,
+        .locked => |p| blk: {
+            try unlock(client, p);
+            break :blk p;
+        },
         .none => return Error.EntryNotFound,
     };
     defer client.gpa.free(item_path);
@@ -145,12 +166,18 @@ pub fn delete(client: *Client, service: []const u8, key: []const u8) Error!void 
 
     var r = wire.Reader.init(reply.body);
     const prompt_path = r.readObjectPath() catch return Error.PlatformFailure;
-    if (!std.mem.eql(u8, prompt_path, "/")) return Error.Locked;
+    if (!std.mem.eql(u8, prompt_path, "/")) {
+        prompt.run(&client.conn, prompt_path) catch |e| return switch (e) {
+            error.Locked => Error.Locked,
+            error.OutOfMemory => Error.OutOfMemory,
+            else => Error.PlatformFailure,
+        };
+    }
 }
 
 const Found = union(enum) {
     unlocked: []u8,
-    locked,
+    locked: []u8,
     none,
 };
 
@@ -178,8 +205,48 @@ fn searchItem(client: *Client, service: []const u8, key: []const u8) Error!Found
     }
     r.pos = unlocked.end;
     const locked = r.beginArray(4) catch return Error.PlatformFailure;
-    if (r.arrayHasMore(locked)) return Found{ .locked = {} };
+    if (r.arrayHasMore(locked)) {
+        const path = r.readObjectPath() catch return Error.PlatformFailure;
+        return Found{ .locked = try client.gpa.dupe(u8, path) };
+    }
     return Found{ .none = {} };
+}
+
+/// Unlock a single object (item or collection) via `Service.Unlock`. If the
+/// daemon needs user confirmation, the prompt is driven through to
+/// completion; a dismissed prompt surfaces as `error.Locked`.
+fn unlock(client: *Client, object_path: []const u8) Error!void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(client.gpa);
+    var w = wire.Writer.init(client.gpa, &body);
+    const arr = try w.beginArray(4);
+    try w.writeObjectPath(object_path);
+    w.endArray(arr);
+
+    var reply = connection.call(&client.conn, .{
+        .destination = session.service_destination,
+        .path = session.service_path,
+        .interface = session.service_interface,
+        .member = "Unlock",
+        .signature = "ao",
+        .body = body.items,
+    }) catch return Error.PlatformFailure;
+    defer reply.deinit();
+    if (reply.err) |_| return Error.PlatformFailure;
+
+    var r = wire.Reader.init(reply.body);
+    const unlocked_arr = r.beginArray(4) catch return Error.PlatformFailure;
+    // Skip the immediately-unlocked array; we only care whether a prompt is
+    // attached.
+    r.pos = unlocked_arr.end;
+    const prompt_path = r.readObjectPath() catch return Error.PlatformFailure;
+    if (!std.mem.eql(u8, prompt_path, "/")) {
+        prompt.run(&client.conn, prompt_path) catch |e| return switch (e) {
+            error.Locked => Error.Locked,
+            error.OutOfMemory => Error.OutOfMemory,
+            else => Error.PlatformFailure,
+        };
+    }
 }
 
 fn defaultCollection(client: *Client) Error![]u8 {

@@ -257,6 +257,89 @@ fn mapParseError(e: message.ParseError) Error {
     };
 }
 
+/// Block reading the socket until a signal arrives matching `path`,
+/// `interface`, and `member`. Drops any non-matching messages. Used to
+/// wait for `org.freedesktop.Secret.Prompt.Completed` after calling
+/// `Prompt()` on a prompt object.
+pub fn waitForSignal(
+    conn: *Connection,
+    path: []const u8,
+    interface: []const u8,
+    member: []const u8,
+) Error!Reply {
+    while (true) {
+        var arena = std.heap.ArenaAllocator.init(conn.gpa);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+
+        var prefix: [message.min_header_bytes]u8 = undefined;
+        try readExact(conn.fd, &prefix);
+        const total = message.totalLength(prefix) catch return Error.Truncated;
+        const bytes = aa.alloc(u8, total) catch return Error.OutOfMemory;
+        @memcpy(bytes[0..message.min_header_bytes], &prefix);
+        try readExact(conn.fd, bytes[message.min_header_bytes..]);
+        const parsed = message.parse(bytes) catch |e| return mapParseError(e);
+
+        const is_match = parsed.header.msg_type == .signal and
+            parsed.header.path != null and std.mem.eql(u8, parsed.header.path.?, path) and
+            parsed.header.interface != null and std.mem.eql(u8, parsed.header.interface.?, interface) and
+            parsed.header.member != null and std.mem.eql(u8, parsed.header.member.?, member);
+
+        if (!is_match) {
+            arena.deinit();
+            continue;
+        }
+
+        return .{
+            .arena = arena,
+            .body = parsed.body,
+            .signature = parsed.header.signature,
+            .err = null,
+        };
+    }
+}
+
+/// Subscribe to a class of bus messages so the daemon will route matching
+/// signals to us. `rule` is the standard D-Bus match-rule syntax, e.g.
+/// `type='signal',interface='org.freedesktop.Secret.Prompt',member='Completed',path='/foo'`.
+pub fn addMatch(conn: *Connection, rule: []const u8) Error!void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(conn.gpa);
+    var w = wire.Writer.init(conn.gpa, &body);
+    try w.writeString(rule);
+
+    var reply = try call(conn, .{
+        .destination = "org.freedesktop.DBus",
+        .path = "/org/freedesktop/DBus",
+        .interface = "org.freedesktop.DBus",
+        .member = "AddMatch",
+        .signature = "s",
+        .body = body.items,
+    });
+    defer reply.deinit();
+    if (reply.err) |_| return Error.MethodCallFailed;
+}
+
+/// Inverse of `addMatch`. Best-effort; errors are surfaced for diagnostics
+/// but callers typically wrap this in `catch {}`.
+pub fn removeMatch(conn: *Connection, rule: []const u8) Error!void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(conn.gpa);
+    var w = wire.Writer.init(conn.gpa, &body);
+    try w.writeString(rule);
+
+    var reply = try call(conn, .{
+        .destination = "org.freedesktop.DBus",
+        .path = "/org/freedesktop/DBus",
+        .interface = "org.freedesktop.DBus",
+        .member = "RemoveMatch",
+        .signature = "s",
+        .body = body.items,
+    });
+    defer reply.deinit();
+    if (reply.err) |_| return Error.MethodCallFailed;
+}
+
 fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {

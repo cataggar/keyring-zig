@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 
 pub const encoding = @import("encoding.zig");
 pub const session = if (builtin.os.tag == .linux) @import("session.zig") else struct {};
+pub const prompt = if (builtin.os.tag == .linux) @import("prompt.zig") else struct {};
 pub const client = if (builtin.os.tag == .linux) @import("client.zig") else struct {};
 
 test {
@@ -13,6 +14,7 @@ test {
     _ = encoding;
     if (builtin.os.tag == .linux) {
         _ = session;
+        _ = prompt;
         _ = client;
     }
 }
