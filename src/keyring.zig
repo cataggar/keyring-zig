@@ -23,10 +23,6 @@ const os_keyring = switch (builtin.os.tag) {
 const null_keyring = @import("keyring-null.zig");
 const file_keyring = @import("keyring-file.zig");
 
-test {
-    _ = @import("dbus/dbus.zig");
-}
-
 var default_backend: ?Backend = null;
 var env_backend_checked = false;
 var env_backend: ?Backend = null;
