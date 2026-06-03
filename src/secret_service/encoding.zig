@@ -10,6 +10,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wire = @import("dbus").wire;
 
+const aes_cbc = @import("aes_cbc.zig");
+
 /// Schema name written into the `xdg:schema` attribute. Matches libsecret's
 /// `SECRET_SCHEMA_TYPE_NOTE`-equivalent name used by the existing
 /// `keyring-linux.zig` backend so items written by either implementation are
@@ -20,6 +22,21 @@ pub const Attributes = struct {
     service: []const u8,
     username: []const u8,
 };
+
+/// Per-write cipher used for `(oayays)` secret tuples. `.plain` keeps the
+/// historical behavior (empty `parameters`, raw value). `.dh_ietf` carries
+/// a 16-byte AES-128 key plus a 16-byte IV that gets serialized into the
+/// `parameters` field; the value is the CBC-PKCS#7 ciphertext.
+pub const SessionCipher = union(enum) {
+    plain,
+    dh_ietf: struct {
+        key: [aes_cbc.key_length]u8,
+        iv: [aes_cbc.block_length]u8,
+    },
+};
+
+pub const WriteCreateItemError = wire.WriteError || aes_cbc.Error;
+pub const DecryptSecretError = aes_cbc.Error || error{InvalidParameters};
 
 /// Marshal an `a{ss}` attributes dict with `service`, `username`, and
 /// `xdg:schema` entries. Entries are sorted by key to keep the bytes
@@ -44,7 +61,9 @@ fn writeDictSS(w: *wire.Writer, key: []const u8, value: []const u8) wire.WriteEr
 /// Properties are emitted as a two-entry `a{sv}` dict with
 /// `org.freedesktop.Secret.Item.Label` and
 /// `org.freedesktop.Secret.Item.Attributes`. The secret is the standard
-/// `(oayays)` tuple with empty parameters and `text/plain` content type.
+/// `(oayays)` tuple. For `.plain` cipher, `parameters` is empty and `value`
+/// is the cleartext. For `.dh_ietf`, `parameters` is the 16-byte IV and
+/// `value` is the AES-128-CBC + PKCS#7 ciphertext.
 pub fn writeCreateItemBody(
     gpa: Allocator,
     buf: *std.ArrayList(u8),
@@ -53,7 +72,8 @@ pub fn writeCreateItemBody(
     session_path: []const u8,
     value: []const u8,
     replace: bool,
-) wire.WriteError!void {
+    cipher: SessionCipher,
+) WriteCreateItemError!void {
     var w = wire.Writer.init(gpa, buf);
 
     // a{sv} properties
@@ -80,15 +100,37 @@ pub fn writeCreateItemBody(
     // (oayays) secret
     try w.alignStruct();
     try w.writeObjectPath(session_path);
-    {
-        const params = try w.beginArray(1);
-        w.endArray(params);
+
+    switch (cipher) {
+        .plain => {
+            // Empty parameters, cleartext value.
+            {
+                const params = try w.beginArray(1);
+                w.endArray(params);
+            }
+            {
+                const bytes = try w.beginArray(1);
+                try w.writeBytes(value);
+                w.endArray(bytes);
+            }
+        },
+        .dh_ietf => |cfg| {
+            // parameters = IV (16 bytes); value = CBC-PKCS#7(value).
+            {
+                const params = try w.beginArray(1);
+                try w.writeBytes(&cfg.iv);
+                w.endArray(params);
+            }
+            const ct = try aes_cbc.encrypt(gpa, cfg.key, cfg.iv, value);
+            defer gpa.free(ct);
+            {
+                const bytes = try w.beginArray(1);
+                try w.writeBytes(ct);
+                w.endArray(bytes);
+            }
+        },
     }
-    {
-        const bytes = try w.beginArray(1);
-        try w.writeBytes(value);
-        w.endArray(bytes);
-    }
+
     try w.writeString("text/plain");
 
     // b replace
@@ -121,6 +163,26 @@ pub fn readSecret(body: []const u8) ReadSecretError!Secret {
         .value = value,
         .content_type = content_type,
     };
+}
+
+/// Convert a parsed `Secret` into cleartext bytes. Caller owns the returned
+/// slice. For `.plain`, the value is duplicated; for `.dh_ietf`, the
+/// daemon-supplied `parameters` is interpreted as the CBC IV and the value
+/// is decrypted in place.
+pub fn decryptSecret(
+    gpa: Allocator,
+    secret: Secret,
+    cipher: SessionCipher,
+) DecryptSecretError![]u8 {
+    switch (cipher) {
+        .plain => return try gpa.dupe(u8, secret.value),
+        .dh_ietf => |cfg| {
+            if (secret.parameters.len != aes_cbc.block_length) return error.InvalidParameters;
+            var iv: [aes_cbc.block_length]u8 = undefined;
+            @memcpy(&iv, secret.parameters);
+            return try aes_cbc.decrypt(gpa, cfg.key, iv, secret.value);
+        },
+    }
 }
 
 test "writeAttributes produces three dict entries" {
@@ -161,6 +223,7 @@ test "writeCreateItemBody round-trips through the parser" {
         "/org/freedesktop/secrets/session/s1",
         "the-secret",
         true,
+        .plain,
     );
 
     var r = wire.Reader.init(buf.items);
@@ -217,6 +280,7 @@ test "readSecret extracts value bytes" {
         "/sess",
         "abcd",
         false,
+        .plain,
     );
     // The (oayays) starts at the 8-byte alignment after the a{sv}; reuse the
     // parsed body offset by walking the parser as a black box.
@@ -227,4 +291,59 @@ test "readSecret extracts value bytes" {
     const secret = try readSecret(buf.items[r.pos..]);
     try std.testing.expectEqualStrings("abcd", secret.value);
     try std.testing.expectEqualStrings("text/plain", secret.content_type);
+
+    // decryptSecret on a .plain cipher dupes the value.
+    const plain = try decryptSecret(std.testing.allocator, secret, .plain);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("abcd", plain);
+}
+
+test "writeCreateItemBody + decryptSecret round-trip under .dh_ietf" {
+    const cipher: SessionCipher = .{ .dh_ietf = .{
+        .key = @splat(0x42),
+        .iv = @splat(0x37),
+    } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeCreateItemBody(
+        std.testing.allocator,
+        &buf,
+        "label",
+        .{ .service = "s", .username = "u" },
+        "/sess",
+        "the-secret",
+        false,
+        cipher,
+    );
+
+    var r = wire.Reader.init(buf.items);
+    const props = try r.beginArray(8);
+    r.pos = props.end;
+    try r.alignStruct();
+    const secret = try readSecret(buf.items[r.pos..]);
+
+    // parameters carries the IV exactly; value is the ciphertext.
+    try std.testing.expectEqual(@as(usize, 16), secret.parameters.len);
+    try std.testing.expectEqual(@as(u8, 0x37), secret.parameters[0]);
+    try std.testing.expect(!std.mem.eql(u8, secret.value, "the-secret"));
+    try std.testing.expectEqual(@as(usize, 16), secret.value.len); // pkcs7 pads to 16
+
+    const plain = try decryptSecret(std.testing.allocator, secret, cipher);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("the-secret", plain);
+}
+
+test "decryptSecret rejects wrong-length parameters under .dh_ietf" {
+    const cipher: SessionCipher = .{ .dh_ietf = .{
+        .key = @splat(0),
+        .iv = @splat(0),
+    } };
+    const bogus: Secret = .{
+        .session = "/sess",
+        .parameters = "short",
+        .value = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .content_type = "text/plain",
+    };
+    try std.testing.expectError(error.InvalidParameters, decryptSecret(std.testing.allocator, bogus, cipher));
 }

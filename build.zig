@@ -9,8 +9,22 @@ pub fn build(b: *std.Build) void {
         "Include the optional file backend (XDG path, AES-GCM, Argon2id passphrase)",
     ) orelse false;
 
+    const ss_transport_str = b.option(
+        []const u8,
+        "secret-service-transport",
+        "Secret Service transport: auto|plain|dh (default: auto, keeps plain for v1)",
+    ) orelse "auto";
+    const ss_transport: SsTransportOpt = parseSsTransport(ss_transport_str) orelse {
+        std.debug.print(
+            "invalid -Dsecret-service-transport={s}; expected auto|plain|dh\n",
+            .{ss_transport_str},
+        );
+        std.process.exit(1);
+    };
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_file_backend", enable_file_backend);
+    build_options.addOption(SsTransportOpt, "secret_service_transport", ss_transport);
     const build_options_mod = build_options.createModule();
 
     // Shared dbus + secret_service modules that the Linux backend imports.
@@ -25,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     ss_mod.addImport("dbus", dbus_mod);
+    ss_mod.addImport("build_options", build_options_mod);
     if (target.result.os.tag == .linux) ss_mod.link_libc = true;
 
     const mod = b.addModule("keyring_zig", .{
@@ -73,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     ss_test_mod.addImport("dbus", dbus_mod);
+    ss_test_mod.addImport("build_options", build_options_mod);
     if (target.result.os.tag == .linux) ss_test_mod.link_libc = true;
     const ss_tests = b.addTest(.{
         .root_module = ss_test_mod,
@@ -101,4 +117,21 @@ fn linkPlatformDeps(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
         },
         else => {},
     }
+}
+
+/// Secret Service transport selection for `-Dsecret-service-transport`.
+///
+/// * `auto`  – behavior matches the historical default: open a `plain`
+///             session. Reserved for a future change where we try `dh`
+///             first and fall back to `plain` automatically.
+/// * `plain` – force the unencrypted transport.
+/// * `dh`    – negotiate `dh-ietf1024-sha256-aes128-cbc-pkcs7`, falling
+///             back to `plain` only when the daemon reports `NotSupported`.
+pub const SsTransportOpt = enum { auto, plain, dh };
+
+fn parseSsTransport(s: []const u8) ?SsTransportOpt {
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    if (std.mem.eql(u8, s, "plain")) return .plain;
+    if (std.mem.eql(u8, s, "dh")) return .dh;
+    return null;
 }

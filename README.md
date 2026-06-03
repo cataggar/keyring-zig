@@ -49,6 +49,37 @@ The non-allocating Linux calls currently use fixed stack buffers for NUL-termina
 
 `getAlloc`, `setAlloc`, and `deleteAlloc` do not impose those `service` and `key` limits.
 
+### Encrypted transport
+
+The Secret Service spec defines two transports for the per-session secret
+exchange:
+
+- `plain` — empty `parameters`, cleartext `value`. Used by default and is
+  safe on the standard user-session bus because the AF_UNIX socket is
+  uid-restricted.
+- `dh-ietf1024-sha256-aes128-cbc-pkcs7` — 1024-bit MODP Diffie-Hellman
+  (RFC 2409 §6.2) followed by HKDF-SHA256 to a 16-byte AES-128 key, with
+  each `(oayays)` body carrying a 16-byte CBC IV in `parameters` and the
+  PKCS#7-padded ciphertext in `value`. The math comes from
+  `std.crypto.ff` and `std.crypto.core.aes`; no third-party crypto
+  dependencies are linked.
+
+Select the transport at build time with `-Dsecret-service-transport`:
+
+| Value   | Behavior                                                                 |
+|---------|--------------------------------------------------------------------------|
+| `auto`  | Current default. Opens a `plain` session. Reserved for a future change.  |
+| `plain` | Force `plain`.                                                           |
+| `dh`    | Negotiate DH-IETF; fall back to `plain` if the daemon reports `NotSupported`. |
+
+```sh
+zig build -Dsecret-service-transport=dh
+```
+
+`plain` remains the default for now so the DH path can be validated in
+the wild against `gnome-keyring-daemon`, `oo7-daemon`, and the KWallet
+Secret Service bridge before being promoted.
+
 ## Windows Notes
 
 The non-allocating Windows calls use fixed-size UTF-16 conversion buffers, so they currently impose these input size limits:
