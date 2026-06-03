@@ -359,7 +359,7 @@ fn defaultCollection(client: *Client) Error![]u8 {
     return try client.gpa.dupe(u8, path);
 }
 
-fn serviceAvailable(gpa: Allocator) bool {
+pub fn serviceAvailable(gpa: Allocator) bool {
     var conn = connection.connectSession(gpa) catch return false;
     defer conn.deinit();
 

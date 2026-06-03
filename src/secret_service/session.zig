@@ -202,13 +202,14 @@ test "openPlainSession marshalling is correct" {
 
     const expected = [_]u8{
         // string "plain" (length 5 + 5 bytes + NUL)
-        5, 0, 0, 0, 'p', 'l', 'a', 'i', 'n', 0,
+        5, 0,   0, 0, 'p', 'l', 'a', 'i', 'n', 0,
         // pad to next 1-aligned: none. signature "s": length 1 + 's' + NUL
         1, 's', 0,
         // pad to 4-aligned for the inner string length (we are at offset 13)
-        0, 0, 0,
+        0, 0,   0,
         // empty string: length 0 + NUL
-        0, 0, 0, 0, 0,
+          0,   0,   0,   0,
+        0,
     };
     try std.testing.expectEqualSlices(u8, &expected, body.items);
 }
