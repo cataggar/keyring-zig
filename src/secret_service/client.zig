@@ -1,8 +1,13 @@
 //! High-level Secret Service operations used by `keyring-linux.zig`.
 //!
-//! Each operation opens (or reuses) a "plain" session, looks up / writes /
+//! Each operation opens (or reuses) a session, looks up / writes /
 //! deletes one item in the default collection, and returns through the
-//! normalized error set. Item attributes mirror what libsecret stores
+//! normalized error set. The session may be `plain` (cleartext on the
+//! AF_UNIX bus) or `dh_ietf` (AES-128-CBC + PKCS#7 with a key derived
+//! from a 1024-bit DH exchange). The transport is selected at compile
+//! time via the `-Dsecret-service-transport=auto|plain|dh` build option,
+//! with `dh` automatically falling back to `plain` if the daemon reports
+//! `NotSupported`. Item attributes mirror what libsecret stores
 //! (`service`, `username`, `xdg:schema = "org.freedesktop.Secret.Generic"`),
 //! so values written by the libsecret backend remain readable here and
 //! vice versa.
@@ -13,10 +18,12 @@ const Allocator = std.mem.Allocator;
 const dbus = @import("dbus");
 const wire = dbus.wire;
 const connection = dbus.connection;
+const build_options = @import("build_options");
 
 const encoding = @import("encoding.zig");
 const session = @import("session.zig");
 const prompt = @import("prompt.zig");
+const aes_cbc = @import("aes_cbc.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("secret_service.client requires Linux");
@@ -35,10 +42,29 @@ pub const Client = struct {
     gpa: Allocator,
     conn: connection.Connection,
     session_path: []u8,
+    /// Session AES-128 key when the negotiated transport is `dh_ietf`;
+    /// `null` for `plain`.
+    session_key: ?[aes_cbc.key_length]u8,
 
     pub fn deinit(self: *Client) void {
         self.gpa.free(self.session_path);
         self.conn.deinit();
+    }
+
+    fn cipherFor(self: Client, iv: [aes_cbc.block_length]u8) encoding.SessionCipher {
+        return if (self.session_key) |k|
+            .{ .dh_ietf = .{ .key = k, .iv = iv } }
+        else
+            .plain;
+    }
+
+    fn readCipher(self: Client) encoding.SessionCipher {
+        // For reads the daemon supplies the IV in `parameters`; pass a
+        // zero placeholder here.
+        return if (self.session_key) |k|
+            .{ .dh_ietf = .{ .key = k, .iv = @splat(0) } }
+        else
+            .plain;
     }
 };
 
@@ -46,8 +72,58 @@ pub fn open(gpa: Allocator) Error!Client {
     var conn = connection.connectSession(gpa) catch return Error.NoStorageAccess;
     errdefer conn.deinit();
 
-    const session_path = session.openPlainSession(&conn, gpa) catch return Error.PlatformFailure;
-    return .{ .gpa = gpa, .conn = conn, .session_path = session_path };
+    const want = pickTransport();
+    const result = openWithFallback(&conn, want, gpa) catch return Error.PlatformFailure;
+    return .{
+        .gpa = gpa,
+        .conn = conn,
+        .session_path = result.path,
+        .session_key = result.key,
+    };
+}
+
+/// Try the requested transport; on `dh_ietf` `NotSupported`, retry with
+/// `plain` so the keyring stays usable against daemons that only speak
+/// the cleartext algorithm.
+fn openWithFallback(
+    conn: *connection.Connection,
+    transport: session.Transport,
+    out_gpa: Allocator,
+) session.Error!session.OpenResult {
+    if (session.openSession(conn, transport, out_gpa)) |r| {
+        return r;
+    } else |err| switch (err) {
+        error.TransportNotSupported => {
+            if (transport == .plain) return err;
+            return session.openSession(conn, .plain, out_gpa);
+        },
+        else => return err,
+    }
+}
+
+fn pickTransport() session.Transport {
+    // The `KEYRING_TEST_TRANSPORT` env var lets the integration tests
+    // exercise the `dh_ietf` path without rebuilding with a custom
+    // `-Dsecret-service-transport`. It is intentionally undocumented for
+    // end users.
+    if (envEquals("KEYRING_TEST_TRANSPORT", "dh")) return .dh_ietf;
+    if (envEquals("KEYRING_TEST_TRANSPORT", "plain")) return .plain;
+    return switch (build_options.secret_service_transport) {
+        .auto, .plain => .plain,
+        .dh => .dh_ietf,
+    };
+}
+
+fn envEquals(name: []const u8, expected: []const u8) bool {
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const item = std.mem.span(entry);
+        if (item.len > name.len and item[name.len] == '=' and std.mem.eql(u8, item[0..name.len], name)) {
+            const value = item[name.len + 1 ..];
+            return std.mem.eql(u8, value, expected);
+        }
+    }
+    return false;
 }
 
 /// Look up the value for `(service, key)`. Returns `EntryNotFound` when no
@@ -83,7 +159,10 @@ pub fn get(client: *Client, service: []const u8, key: []const u8, out_gpa: Alloc
     if (reply.err) |_| return Error.PlatformFailure;
 
     const secret = encoding.readSecret(reply.body) catch return Error.PlatformFailure;
-    return try out_gpa.dupe(u8, secret.value);
+    const plaintext = encoding.decryptSecret(client.gpa, secret, client.readCipher()) catch
+        return Error.PlatformFailure;
+    defer client.gpa.free(plaintext);
+    return try out_gpa.dupe(u8, plaintext);
 }
 
 pub fn set(client: *Client, service: []const u8, key: []const u8, value: []const u8) Error!void {
@@ -96,9 +175,12 @@ pub fn set(client: *Client, service: []const u8, key: []const u8, value: []const
     try label_buf.append(client.gpa, '/');
     try label_buf.appendSlice(client.gpa, key);
 
+    var iv: [aes_cbc.block_length]u8 = undefined;
+    if (client.session_key != null) randomBytes(&iv);
+
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(client.gpa);
-    try encoding.writeCreateItemBody(
+    encoding.writeCreateItemBody(
         client.gpa,
         &body,
         label_buf.items,
@@ -106,7 +188,8 @@ pub fn set(client: *Client, service: []const u8, key: []const u8, value: []const
         client.session_path,
         value,
         true,
-    );
+        client.cipherFor(iv),
+    ) catch return Error.PlatformFailure;
 
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
@@ -139,6 +222,10 @@ pub fn set(client: *Client, service: []const u8, key: []const u8, value: []const
         }
         return;
     }
+}
+
+fn randomBytes(buf: []u8) void {
+    session.secureRandom(buf);
 }
 
 pub fn delete(client: *Client, service: []const u8, key: []const u8) Error!void {
@@ -272,7 +359,7 @@ fn defaultCollection(client: *Client) Error![]u8 {
     return try client.gpa.dupe(u8, path);
 }
 
-fn serviceAvailable(gpa: Allocator) bool {
+pub fn serviceAvailable(gpa: Allocator) bool {
     var conn = connection.connectSession(gpa) catch return false;
     defer conn.deinit();
 

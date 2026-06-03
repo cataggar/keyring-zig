@@ -38,6 +38,8 @@ jobs:
             eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
             zig build --verbose --summary all test
             zig build --verbose --summary all test -Dfile-backend=true
+            zig build --verbose --summary all test-secret-service -Dsecret-service-transport=dh
+            KEYRING_TEST_TRANSPORT=dh zig build --verbose --summary all test
           '
 
       - name: Run tests
@@ -45,3 +47,32 @@ jobs:
         run: |
           zig build --verbose --summary all test
           zig build --verbose --summary all test -Dfile-backend=true
+
+  secret-service-transports:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [auto, plain, dh]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus \
+            gnome-keyring
+
+      - name: Run Secret Service transport coverage
+        shell: bash
+        run: |
+          dbus-run-session -- bash -lc '
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            zig build --verbose --summary all test-secret-service -Dsecret-service-transport=${{ matrix.transport }}
+            zig build --verbose --summary all test -Dsecret-service-transport=${{ matrix.transport }}
+          '

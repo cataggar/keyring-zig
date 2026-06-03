@@ -22,6 +22,7 @@ const os_keyring = switch (builtin.os.tag) {
 };
 const null_keyring = @import("keyring-null.zig");
 const file_keyring = @import("keyring-file.zig");
+const secret_service = @import("secret_service");
 
 var default_backend: ?Backend = null;
 var env_backend_checked = false;
@@ -212,7 +213,16 @@ fn randomTestName(comptime prefix: []const u8) [prefix.len + 16]u8 {
     return buf;
 }
 
+fn requireSecretServiceForTest() bool {
+    return switch (builtin.os.tag) {
+        .linux => secret_service.client.serviceAvailable(std.testing.allocator),
+        else => true,
+    };
+}
+
 test "get missing entry fails" {
+    if (!requireSecretServiceForTest()) return;
+
     const service = randomTestName("keyring-zig-missing-service-");
     const key = randomTestName("keyring-zig-missing-key-");
 
@@ -221,6 +231,8 @@ test "get missing entry fails" {
 }
 
 test "set then get works" {
+    if (!requireSecretServiceForTest()) return;
+
     const service = randomTestName("keyring-zig-create-service-");
     const key = randomTestName("keyring-zig-create-key-");
     const value = "first-value";
@@ -235,6 +247,8 @@ test "set then get works" {
 }
 
 test "setAlloc then get works" {
+    if (!requireSecretServiceForTest()) return;
+
     const service = randomTestName("keyring-zig-alloc-create-service-");
     const key = randomTestName("keyring-zig-alloc-create-key-");
     const value = "alloc-value";
@@ -249,6 +263,8 @@ test "setAlloc then get works" {
 }
 
 test "set then modify works" {
+    if (!requireSecretServiceForTest()) return;
+
     const service = randomTestName("keyring-zig-update-service-");
     const key = randomTestName("keyring-zig-update-key-");
     const first = "first-value";
