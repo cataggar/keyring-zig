@@ -38,6 +38,8 @@ jobs:
             eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
             zig build --verbose --summary all test
             zig build --verbose --summary all test -Dfile-backend=true
+            zig build --verbose --summary all test-secret-service -Dsecret-service-transport=dh
+            KEYRING_TEST_TRANSPORT=dh zig build --verbose --summary all test
           '
 
       - name: Run tests
