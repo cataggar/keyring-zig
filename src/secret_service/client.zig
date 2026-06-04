@@ -271,7 +271,7 @@ const Found = union(enum) {
 fn searchItem(client: *Client, service: []const u8, key: []const u8) Error!Found {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(client.gpa);
-    try encoding.writeAttributes(client.gpa, &body, .{ .service = service, .username = key });
+    try encoding.writeSearchAttributes(client.gpa, &body, .{ .service = service, .username = key });
 
     var reply = connection.call(&client.conn, .{
         .destination = session.service_destination,
