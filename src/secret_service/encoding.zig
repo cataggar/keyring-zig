@@ -50,6 +50,16 @@ pub fn writeAttributes(gpa: Allocator, buf: *std.ArrayList(u8), attrs: Attribute
     w.endArray(arr);
 }
 
+/// Marshal a SearchItems query. Do not include `xdg:schema`: Python keyring's
+/// SecretStorage backend writes only `service`, `username`, and `application`.
+pub fn writeSearchAttributes(gpa: Allocator, buf: *std.ArrayList(u8), attrs: Attributes) wire.WriteError!void {
+    var w = wire.Writer.init(gpa, buf);
+    const arr = try w.beginArray(8);
+    try writeDictSS(&w, "service", attrs.service);
+    try writeDictSS(&w, "username", attrs.username);
+    w.endArray(arr);
+}
+
 fn writeDictSS(w: *wire.Writer, key: []const u8, value: []const u8) wire.WriteError!void {
     try w.alignStruct();
     try w.writeString(key);
@@ -210,6 +220,30 @@ test "writeAttributes produces three dict entries" {
     try std.testing.expectEqualStrings("user", got[1].v);
     try std.testing.expectEqualStrings("xdg:schema", got[2].k);
     try std.testing.expectEqualStrings(schema_name, got[2].v);
+}
+
+test "writeSearchAttributes omits schema for Python keyring compatibility" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeSearchAttributes(std.testing.allocator, &buf, .{
+        .service = "svc",
+        .username = "user",
+    });
+
+    var r = wire.Reader.init(buf.items);
+    const arr = try r.beginArray(8);
+    var got: [2]struct { k: []const u8, v: []const u8 } = undefined;
+    var i: usize = 0;
+    while (r.arrayHasMore(arr)) : (i += 1) {
+        try r.alignStruct();
+        got[i].k = try r.readString();
+        got[i].v = try r.readString();
+    }
+    try std.testing.expectEqual(@as(usize, 2), i);
+    try std.testing.expectEqualStrings("service", got[0].k);
+    try std.testing.expectEqualStrings("svc", got[0].v);
+    try std.testing.expectEqualStrings("username", got[1].k);
+    try std.testing.expectEqualStrings("user", got[1].v);
 }
 
 test "writeCreateItemBody round-trips through the parser" {
