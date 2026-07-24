@@ -3,8 +3,12 @@ const std = @import("std");
 pub const KeyringMacos = @This();
 
 const sec = @cImport({
-    @cInclude("Security/Security.h");
-    @cInclude("CoreFoundation/CoreFoundation.h");
+    @cInclude("Security/SecItem.h");
+    @cInclude("CoreFoundation/CFString.h");
+    @cInclude("CoreFoundation/CFData.h");
+    @cInclude("CoreFoundation/CFDictionary.h");
+    @cInclude("CoreFoundation/CFNumber.h");
+
 });
 
 fn makeCfString(bytes: []const u8) error{CfStringCreationFailed}!sec.CFStringRef {
