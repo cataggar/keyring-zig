@@ -218,7 +218,7 @@ test "decrypt rejects empty ciphertext" {
 test "decrypt rejects non-block-multiple ciphertext" {
     const key: Key = @splat(0);
     const iv: Iv = @splat(0);
-    const bad = [_]u8{0} ** 17;
+    const bad: [17]u8 = @splat(0);
     try testing.expectError(
         Error.InvalidCiphertextLength,
         decrypt(testing.allocator, key, iv, &bad),

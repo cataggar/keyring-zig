@@ -106,7 +106,7 @@ fn linkPlatformDeps(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
             module.linkFramework("CoreFoundation", .{});
         },
         .windows => {
-            module.linkSystemLibrary("Advapi32", .{});
+            module.linkSystemLibrary("advapi32", .{});
         },
         .linux => {
             // Only `libc` is required, for `std.c.environ` in the D-Bus

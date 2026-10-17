@@ -880,11 +880,11 @@ test "file backend: getAlloc handles large values" {
     const path = try testStorePath(&tmp, "store.bin", gpa);
     defer gpa.free(path);
 
-    const value = "x" ** 8192;
-    try setWithFast(gpa, path, test_passphrase, "svc", "user", value);
+    const value: [8192]u8 = @splat('x');
+    try setWithFast(gpa, path, test_passphrase, "svc", "user", &value);
     const got = try getAllocWith(gpa, path, test_passphrase, "svc", "user");
     defer gpa.free(got);
-    try std.testing.expectEqualSlices(u8, value, got);
+    try std.testing.expectEqualSlices(u8, &value, got);
 }
 
 // Test-only fast variant of `setWith` that uses cheap Argon2id parameters
