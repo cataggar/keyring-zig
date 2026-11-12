@@ -5,8 +5,9 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  ZIG_VERSION: 0.17.0
+permissions:
+  contents: read
+  attestations: read
 
 jobs:
   test:
@@ -18,17 +19,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@6f3b25f2091c648162dbd0b9b5fff0d79b7fb364 # v0.10.3
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: ${{ env.ZIG_VERSION }}
+          ghr-version: v0.10.3
+          tools: >-
+            cataggar/zig@v0.17.1
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Verify Zig version
+        shell: bash
+        run: |
+          version="$(zig version)"
+          echo "Zig version: $version"
+          test "$version" = "0.17.1"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            dbus \
-            gnome-keyring
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 update &&
+               sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                 dbus gnome-keyring; then
+              exit 0
+            fi
+            echo "apt-get attempt ${attempt} failed; retrying..." >&2
+            sleep 5
+          done
+          exit 1
 
       - name: Run tests on Linux
         if: runner.os == 'Linux'
@@ -57,16 +78,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@6f3b25f2091c648162dbd0b9b5fff0d79b7fb364 # v0.10.3
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: ${{ env.ZIG_VERSION }}
+          ghr-version: v0.10.3
+          tools: >-
+            cataggar/zig@v0.17.1
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Verify Zig version
+        shell: bash
+        run: |
+          version="$(zig version)"
+          echo "Zig version: $version"
+          test "$version" = "0.17.1"
 
       - name: Install Linux dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            dbus \
-            gnome-keyring
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 update &&
+               sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                 dbus gnome-keyring; then
+              exit 0
+            fi
+            echo "apt-get attempt ${attempt} failed; retrying..." >&2
+            sleep 5
+          done
+          exit 1
 
       - name: Run Secret Service transport coverage
         shell: bash
